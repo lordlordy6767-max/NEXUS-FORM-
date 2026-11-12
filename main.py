@@ -26,7 +26,32 @@ def save(): json.dump(db, open(DB_FILE, 'w'), indent=2)
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True  # NEW: needed for auto-roles
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# ---------- NEW: HELPER - GET MEMBER FOR ROLES ----------
+async def get_member_for_roles(guild, user_id):
+    member = guild.get_member(user_id)
+    if member:
+        return member
+    try:
+        member = await guild.fetch_member(user_id)
+        return member
+    except:
+        return None
+
+async def get_candidate_role(guild, form_name=None):
+    # 1. If form has a custom candidate role saved, use it
+    if form_name:
+        gid = str(guild.id)
+        form = db["forms"].get(gid, {}).get(form_name)
+        if form and form.get("candidate_role_id"):
+            role = guild.get_role(form["candidate_role_id"])
+            if role:
+                return role
+    # 2. Default: role named "Candidate"
+    role = discord.utils.get(guild.roles, name="Candidate")
+    return role
 
 # ---------- NEW: DECISION VIEW - FIXES ACCEPT + DENY BOTH ----------
 class DecisionView(discord.ui.View):
@@ -58,6 +83,19 @@ class DecisionView(discord.ui.View):
             msg_text = f"✅ Accepted {applicant.mention if applicant else f'<@{self.applicant_id}>'} for `{self.form_name}`!"
             dm_text = f"✅ **Accepted!** Your application for `{self.form_name}` in **{interaction.guild.name}** was accepted!"
             color = 0x22C55E
+            # NEW: AUTO GIVE CANDIDATE ROLE ON ACCEPT
+            member_obj = await get_member_for_roles(interaction.guild, self.applicant_id)
+            if member_obj:
+                candidate_role = await get_candidate_role(interaction.guild, self.form_name)
+                if candidate_role:
+                    try:
+                        await member_obj.add_roles(candidate_role, reason=f"Accepted for {self.form_name}")
+                        msg_text += f"\n🎭 Gave {candidate_role.mention}"
+                        dm_text += f"\nYou are now **{candidate_role.name}**!"
+                    except Exception as e:
+                        msg_text += f"\n⚠️ Could not give Candidate role (move bot role higher): {e}"
+                else:
+                    msg_text += f"\n⚠️ No `Candidate` role found - create it or use `/form-candidate-role`"
         else:
             self.deny_btn.label = "❌ Denied"
             msg_text = f"❌ Denied {applicant.mention if applicant else f'<@{self.applicant_id}>'} for `{self.form_name}`."
@@ -214,7 +252,7 @@ async def form_open(interaction: discord.Interaction, name: str):
                 embed.color = 0x8B5CF6
                 await msg.edit(embed=embed, view=view)
         except: pass
-    await interaction.response.send_message(f"🟢 **Form `{name}` is now OPEN.**\nApply button is working again. Members can apply.")
+    await interaction.response.send_message(f"🢢 **Form `{name}` is now OPEN.**\nApply button is working again. Members can apply.")
 
 @bot.tree.command(name="form-list", description="List all forms")
 async def form_list(interaction: discord.Interaction):
@@ -238,7 +276,70 @@ async def form_help(interaction: discord.Interaction):
     embed.add_field(name="Staff - 2 Steps", value="**1.** `/form-create name: staff channel: #applications q1: Why join? q2: Age?`\n**2.** `/form-post channel: #apply-here name: staff title: Join Staff`", inline=False)
     embed.add_field(name="Open / Close", value="`/form-close name: staff` - Close, button becomes 🔒 Closed\n`/form-open name: staff` - Open again\n`/form-list` - See OPEN / CLOSED", inline=False)
     embed.add_field(name="Members", value="Just click **📝 Apply Now** button - no command needed!", inline=False)
+    embed.add_field(name="NEW - Roles", value="`/form-candidate-role name: staff role: @Candidate` - Set what role Accept gives\n`/pass user: @user role: @Staff` - Pass interview, removes Candidate, gives role\n`!pass @user @Staff` - Same, with prefix", inline=False)
     await interaction.response.send_message(embed=embed)
+
+# ---------- NEW: CANDIDATE ROLE SETTING + PASS SYSTEM ----------
+@bot.tree.command(name="form-candidate-role", description="Set which role Accept button gives (Candidate)")
+async def form_candidate_role(interaction: discord.Interaction, name: str, role: discord.Role):
+    if not interaction.user.guild_permissions.manage_messages: return await interaction.response.send_message("❌ Need Manage Messages!", ephemeral=True)
+    gid = str(interaction.guild.id)
+    form = db["forms"].get(gid, {}).get(name)
+    if not form: return await interaction.response.send_message("❌ Form not found!", ephemeral=True)
+    form["candidate_role_id"] = role.id
+    save()
+    await interaction.response.send_message(f"✅ For form `{name}`, **Accept** button will now auto-give {role.mention}", ephemeral=True)
+
+async def do_pass(guild, staff_user, target_member, give_role):
+    # Shared logic for /pass and !pass
+    # Remove Candidate role if they have it
+    candidate_role = None
+    # Try to find Candidate from any form in this guild, else by name
+    for f in db["forms"].get(str(guild.id), {}).values():
+        if f.get("candidate_role_id"):
+            r = guild.get_role(f["candidate_role_id"])
+            if r and r in target_member.roles:
+                candidate_role = r
+                break
+    if not candidate_role:
+        candidate_role = discord.utils.get(guild.roles, name="Candidate")
+    try:
+        await target_member.add_roles(give_role, reason=f"Passed interview by {staff_user}")
+        if candidate_role and candidate_role in target_member.roles:
+            await target_member.remove_roles(candidate_role, reason="Passed interview - remove Candidate")
+        return True, candidate_role
+    except Exception as e:
+        return False, str(e)
+
+@bot.tree.command(name="pass", description="Pass interview - give role + remove Candidate")
+async def pass_slash(interaction: discord.Interaction, user: discord.Member, role: discord.Role):
+    if not interaction.user.guild_permissions.manage_messages and not interaction.user.guild_permissions.manage_roles:
+        return await interaction.response.send_message("❌ Need Manage Messages / Manage Roles!", ephemeral=True)
+    ok, info = await do_pass(interaction.guild, interaction.user, user, role)
+    if ok:
+        txt = f"✅ {user.mention} PASSED interview! Gave {role.mention}"
+        if info:
+            txt += f" + removed {info.mention}"
+        await interaction.response.send_message(txt)
+        try: await user.send(f"✅ You PASSED interview in **{interaction.guild.name}**! You got **{role.name}** 🎉")
+        except: pass
+    else:
+        await interaction.response.send_message(f"❌ Could not give role - move NEXUS bot role HIGHER than {role.mention} in Server Settings > Roles. Error: {info}", ephemeral=True)
+
+@bot.command(name="pass")
+async def pass_prefix(ctx, user: discord.Member, role: discord.Role):
+    if not ctx.author.guild_permissions.manage_messages and not ctx.author.guild_permissions.manage_roles:
+        return await ctx.send("❌ Need Manage Messages / Manage Roles!")
+    ok, info = await do_pass(ctx.guild, ctx.author, user, role)
+    if ok:
+        txt = f"✅ {user.mention} PASSED interview! Gave {role.mention}"
+        if info:
+            txt += f" + removed {info.mention}"
+        await ctx.send(txt)
+        try: await user.send(f"✅ You PASSED interview in **{ctx.guild.name}**! You got **{role.name}** 🎉")
+        except: pass
+    else:
+        await ctx.send(f"❌ Could not give role - move NEXUS bot role HIGHER than {role.mention}. Error: {info}")
 
 @bot.tree.command(name="claim-owner", description="Claim owner")
 async def claim_owner(interaction: discord.Interaction, key: str):
